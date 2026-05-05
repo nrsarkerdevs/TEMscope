@@ -1,0 +1,8 @@
+numpy
+pandas
+matplotlib
+scikit-image
+scikit-learn
+opencv-python-headless
+openpyxl
+ipywidgets

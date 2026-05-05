@@ -19,3 +19,6 @@ Run the notebook and place images in the `TEM_images/` folder.
 - Segmented overlays with color maps
 - Feature-level statistics
 - Summary plots across samples
+
+
+[![Launch Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/nrsarkerdevs/TEMscope/main?labpath=tem_seg_main.ipynb&force-rebuild=true)

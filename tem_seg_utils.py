@@ -1027,3 +1027,303 @@ def plot_summary_combined_by_image(
             bbox_inches="tight"
         )
     plt.show()
+
+    # ------------------------------------------------------------
+# Feature-to-feature distance analysis
+# ------------------------------------------------------------
+
+def compute_nearest_neighbor_distances(
+    df_features,
+    pixel_size_column="pixel_size_nm",
+    x_col="centroid_x_px",
+    y_col="centroid_y_px",
+    size_col="equivalent_diameter_nm",
+    group_cols=("image", "feature_population")
+):
+    """
+    Compute nearest-neighbor distances between segmented features.
+
+    Distances reported:
+        nearest_centroid_distance_nm:
+            center-to-center distance between each feature and its nearest neighbor
+
+        nearest_edge_gap_nm:
+            approximate edge-to-edge gap:
+            centroid distance - radius_i - radius_j
+            where radius is estimated from equivalent diameter / 2
+
+    Notes:
+        - Uses feature centroids.
+        - Edge gap is approximate for irregular domains.
+        - Requires at least 2 features per group.
+    """
+
+    if df_features is None or df_features.empty:
+        return pd.DataFrame()
+
+    required_cols = list(group_cols) + [
+        x_col,
+        y_col,
+        size_col,
+        pixel_size_column,
+        "feature_id"
+    ]
+
+    missing_cols = [
+        col for col in required_cols
+        if col not in df_features.columns
+    ]
+
+    if missing_cols:
+        raise ValueError(f"Missing required columns: {missing_cols}")
+
+    distance_records = []
+
+    for group_key, df_group in df_features.groupby(list(group_cols)):
+        df_group = df_group.reset_index(drop=True).copy()
+
+        if len(df_group) < 2:
+            continue
+
+        pixel_size_nm = float(df_group[pixel_size_column].iloc[0])
+
+        coords_px = df_group[[x_col, y_col]].values.astype(float)
+        coords_nm = coords_px * pixel_size_nm
+
+        sizes_nm = df_group[size_col].values.astype(float)
+        radii_nm = sizes_nm / 2.0
+
+        # Pairwise centroid distances
+        diff = coords_nm[:, None, :] - coords_nm[None, :, :]
+        dist_matrix = np.sqrt(np.sum(diff**2, axis=2))
+
+        # Ignore self-distance
+        np.fill_diagonal(dist_matrix, np.inf)
+
+        nearest_idx = np.argmin(dist_matrix, axis=1)
+        nearest_centroid_dist_nm = dist_matrix[
+            np.arange(len(df_group)),
+            nearest_idx
+        ]
+
+        nearest_edge_gap_nm = (
+            nearest_centroid_dist_nm
+            - radii_nm
+            - radii_nm[nearest_idx]
+        )
+
+        nearest_edge_gap_nm = np.maximum(nearest_edge_gap_nm, 0)
+
+        for i, row in df_group.iterrows():
+            nn_i = nearest_idx[i]
+            nn_row = df_group.iloc[nn_i]
+
+            record = {
+                "image": row["image"],
+                "feature_population": row["feature_population"],
+                "feature_id": row["feature_id"],
+                "nearest_neighbor_feature_id": nn_row["feature_id"],
+                "nearest_centroid_distance_nm": nearest_centroid_dist_nm[i],
+                "nearest_edge_gap_nm": nearest_edge_gap_nm[i],
+                "feature_equiv_diameter_nm": row[size_col],
+                "nearest_neighbor_equiv_diameter_nm": nn_row[size_col],
+                "centroid_x_nm": row[x_col] * pixel_size_nm,
+                "centroid_y_nm": row[y_col] * pixel_size_nm,
+                "nearest_centroid_x_nm": nn_row[x_col] * pixel_size_nm,
+                "nearest_centroid_y_nm": nn_row[y_col] * pixel_size_nm
+            }
+
+            # Preserve group metadata if present
+            for col in df_group.columns:
+                if col in [
+                    "n_classes",
+                    "population_mode",
+                    "size_filter_column",
+                    "min_feature_size_nm"
+                ]:
+                    record[col] = row[col]
+
+            distance_records.append(record)
+
+    return pd.DataFrame(distance_records)
+
+
+def summarize_nearest_neighbor_distances(
+    df_distances,
+    group_cols=("image", "feature_population")
+):
+    """
+    Summarize nearest-neighbor distances by image and population.
+    """
+
+    expected_cols = [
+        "image",
+        "feature_population",
+        "n_features_with_distance",
+        "mean_nearest_centroid_distance_nm",
+        "median_nearest_centroid_distance_nm",
+        "std_nearest_centroid_distance_nm",
+        "mean_nearest_edge_gap_nm",
+        "median_nearest_edge_gap_nm",
+        "std_nearest_edge_gap_nm"
+    ]
+
+    if df_distances is None or df_distances.empty:
+        return pd.DataFrame(columns=expected_cols)
+
+    summary = (
+        df_distances
+        .groupby(list(group_cols))
+        .agg(
+            n_features_with_distance=("feature_id", "count"),
+            mean_nearest_centroid_distance_nm=(
+                "nearest_centroid_distance_nm",
+                "mean"
+            ),
+            median_nearest_centroid_distance_nm=(
+                "nearest_centroid_distance_nm",
+                "median"
+            ),
+            std_nearest_centroid_distance_nm=(
+                "nearest_centroid_distance_nm",
+                "std"
+            ),
+            mean_nearest_edge_gap_nm=(
+                "nearest_edge_gap_nm",
+                "mean"
+            ),
+            median_nearest_edge_gap_nm=(
+                "nearest_edge_gap_nm",
+                "median"
+            ),
+            std_nearest_edge_gap_nm=(
+                "nearest_edge_gap_nm",
+                "std"
+            )
+        )
+        .reset_index()
+    )
+
+    return summary
+
+
+def plot_nearest_neighbor_distance_summary(
+    distance_summary,
+    output_path=None,
+    distance_metric="centroid",
+    title="Nearest-Neighbor Feature Spacing"
+):
+    """
+    Plot mean and median nearest-neighbor distance by image/population.
+
+    distance_metric:
+        "centroid" -> center-to-center nearest-neighbor distance
+        "edge"     -> approximate edge-to-edge nearest-neighbor gap
+    """
+
+    if distance_summary is None or distance_summary.empty:
+        print("No distance summary data to plot.")
+        return
+
+    df_plot = distance_summary.copy()
+
+    df_plot["label"] = (
+        df_plot["image"].astype(str)
+        + "\n"
+        + df_plot["feature_population"].astype(str)
+    )
+
+    x = np.arange(len(df_plot))
+
+    sample_style = {
+        "Backbone random": {"color": "lightgray", "hatch": None},
+        "Sidechain random 1.5": {"color": "skyblue", "hatch": "///"},
+        "Sidechain random 1.8": {"color": "skyblue", "hatch": None},
+        "Sidechain block": {"color": "red", "hatch": None},
+        "Backbone block": {"color": "navajowhite", "hatch": None},
+        "Nafion 212": {"color": "black", "hatch": None},
+    }
+
+    bar_colors = [
+        sample_style.get(str(name), {"color": "gray"})["color"]
+        for name in df_plot["image"]
+    ]
+
+    bar_hatches = [
+        sample_style.get(str(name), {"hatch": None})["hatch"]
+        for name in df_plot["image"]
+    ]
+
+
+    if distance_metric == "centroid":
+        mean_col = "mean_nearest_centroid_distance_nm"
+        median_col = "median_nearest_centroid_distance_nm"
+        std_col = "std_nearest_centroid_distance_nm"
+        ylabel = "Nearest centroid distance, nm"
+        panel_label = "centroid-to-centroid"
+    elif distance_metric == "edge":
+        mean_col = "mean_nearest_edge_gap_nm"
+        median_col = "median_nearest_edge_gap_nm"
+        std_col = "std_nearest_edge_gap_nm"
+        ylabel = "Nearest edge gap, nm"
+        panel_label = "edge-to-edge gap"
+    else:
+        raise ValueError("distance_metric must be 'centroid' or 'edge'")
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    means = df_plot[mean_col].values
+    stds = df_plot[std_col].fillna(0).values
+
+    upper_error = stds
+    lower_error = np.minimum(stds, means)
+
+    yerr = np.vstack([lower_error, upper_error])
+
+    bars0 = axes[0].bar(
+        x,
+        means,
+        yerr=yerr,
+        capsize=5,
+        color=bar_colors,
+        edgecolor="black",
+        linewidth=0.8
+    )
+
+    for bar, hatch in zip(bars0, bar_hatches):
+        if hatch is not None:
+            bar.set_hatch(hatch)
+
+    axes[0].set_title(f"Mean nearest-neighbor {panel_label} ± SD")
+    axes[0].set_ylabel(ylabel)
+
+    bars1 = axes[1].bar(
+        x,
+        df_plot[median_col].values,
+        color=bar_colors,
+        edgecolor="black",
+        linewidth=0.8
+    )
+
+    for bar, hatch in zip(bars1, bar_hatches):
+        if hatch is not None:
+            bar.set_hatch(hatch)
+
+    axes[1].set_title(f"Median nearest-neighbor {panel_label}")
+    axes[1].set_ylabel(ylabel)
+
+    for ax in axes:
+        ax.set_xticks(x)
+        ax.set_xticklabels(df_plot["label"], rotation=45, ha="right")
+        ax.grid(axis="y", alpha=0.3)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    fig.suptitle(title, fontsize=15, fontweight="bold", y=1.04)
+
+    plt.tight_layout()
+
+    if output_path is not None:
+        plt.savefig(output_path, dpi=300, bbox_inches="tight")
+
+    plt.show()

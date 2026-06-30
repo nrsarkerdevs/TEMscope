@@ -65,6 +65,35 @@ def read_grayscale_image(
 
     return img
 
+def read_grayscale_image_raw_display(path):
+    """
+    Read grayscale, RGB, or RGBA image and return grayscale image scaled only
+    for display, without percentile/CLAHE normalization.
+
+    This is intended for reporting the actual input image appearance.
+    """
+    img = io.imread(path)
+
+    if img.ndim == 3 and img.shape[2] == 4:
+        img = img[:, :, :3]
+
+    if img.ndim == 3 and img.shape[2] == 3:
+        img = color.rgb2gray(img)
+    elif img.ndim == 2:
+        img = img.astype(float)
+    else:
+        raise ValueError(f"Unsupported image shape: {img.shape}")
+
+    img = img.astype(float)
+
+    # Preserve relative raw contrast; only scale to 0–1 for matplotlib display
+    if img.max() > 1:
+        img_display = img / img.max()
+    else:
+        img_display = img.copy()
+
+    return img_display
+
 def contrast_preprocess(img, use_clahe=True, use_smoothing=False, smoothing_method="gaussian", gaussian_sigma=0.5, median_radius=1, clip_limit=0.03):
     """
     Recommended order:
@@ -289,7 +318,7 @@ def add_dark_pixel_rescue_mask(
     )
 
     return combined_mask, rescue_mask, threshold
-    
+
 
 def estimate_kmeans_dark_cluster_threshold(
     image_paths,
@@ -1396,38 +1425,15 @@ def plot_feature_diameter_vs_distance(
     diameter_metric="equivalent",
     distance_metric="centroid",
     distance_population=None,
-    title="Feature Diameter vs Feature-to-Feature Distance"
+    title="Feature Diameter vs Feature-to-Feature Distance",
+    errorbar_color="purple"
 ):
     """
     Plot feature diameter and nearest-neighbor feature-to-feature distance
     side by side for each sample.
 
-    Parameters
-    ----------
-    feature_summary:
-        Output from summarize_features_combined_by_image(...)
-
-    distance_summary:
-        Output from summarize_nearest_neighbor_distances(...)
-
-    statistic:
-        "median" or "mean"
-
-    diameter_metric:
-        "equivalent" or "feret"
-
-    distance_metric:
-        "centroid" or "edge"
-
-    distance_population:
-        Optional. Use "darkest" if distance_summary contains both darkest
-        and second_darkest populations and you only want the darkest population.
-        Leave as None for darkest_only mode or image-level aggregation.
-
-    Notes
-    -----
-    Feature diameter and nearest-neighbor distance are both plotted in nm.
-    Nearest-neighbor distance is calculated among detected segmented features only.
+    If statistic="mean", error bars show ±1 SD.
+    If statistic="median", no SD error bars are plotted.
     """
 
     if feature_summary is None or feature_summary.empty:
@@ -1441,26 +1447,47 @@ def plot_feature_diameter_vs_distance(
     if statistic not in ["mean", "median"]:
         raise ValueError("statistic must be 'mean' or 'median'")
 
+    # ----------------------------
+    # Choose diameter metric
+    # ----------------------------
     if diameter_metric == "equivalent":
         diameter_col = f"{statistic}_equiv_diameter_nm"
+        diameter_std_col = "std_equiv_diameter_nm"
         diameter_label = f"{statistic.capitalize()} equivalent diameter"
     elif diameter_metric == "feret":
         diameter_col = f"{statistic}_feret_diameter_max_nm"
+        diameter_std_col = "std_feret_diameter_max_nm"
         diameter_label = f"{statistic.capitalize()} Feret diameter"
     else:
         raise ValueError("diameter_metric must be 'equivalent' or 'feret'")
 
+    # ----------------------------
+    # Choose distance metric
+    # ----------------------------
     if distance_metric == "centroid":
         distance_col = f"{statistic}_nearest_centroid_distance_nm"
-        distance_label = f"{statistic.capitalize()} nearest-neighbor centroid distance"
+        distance_std_col = "std_nearest_centroid_distance_nm"
+        distance_label = (
+            f"{statistic.capitalize()} nearest-neighbor centroid distance"
+        )
     elif distance_metric == "edge":
         distance_col = f"{statistic}_nearest_edge_gap_nm"
-        distance_label = f"{statistic.capitalize()} nearest-neighbor edge gap"
+        distance_std_col = "std_nearest_edge_gap_nm"
+        distance_label = (
+            f"{statistic.capitalize()} nearest-neighbor edge gap"
+        )
     else:
         raise ValueError("distance_metric must be 'centroid' or 'edge'")
 
+    # ----------------------------
+    # Check columns
+    # ----------------------------
     required_feature_cols = ["image", diameter_col]
     required_distance_cols = ["image", distance_col]
+
+    if statistic == "mean":
+        required_feature_cols.append(diameter_std_col)
+        required_distance_cols.append(distance_std_col)
 
     missing_feature_cols = [
         col for col in required_feature_cols
@@ -1473,11 +1500,18 @@ def plot_feature_diameter_vs_distance(
     ]
 
     if missing_feature_cols:
-        raise ValueError(f"Missing feature summary columns: {missing_feature_cols}")
+        raise ValueError(
+            f"Missing feature summary columns: {missing_feature_cols}"
+        )
 
     if missing_distance_cols:
-        raise ValueError(f"Missing distance summary columns: {missing_distance_cols}")
+        raise ValueError(
+            f"Missing distance summary columns: {missing_distance_cols}"
+        )
 
+    # ----------------------------
+    # Sample colors
+    # ----------------------------
     sample_style = {
         "Backbone random": {"color": "lightgray", "hatch": None},
         "Sidechain random 1.5": {"color": "skyblue", "hatch": "///"},
@@ -1495,7 +1529,9 @@ def plot_feature_diameter_vs_distance(
     feature_plot["image"] = feature_plot["image"].astype(str)
     distance_plot["image"] = distance_plot["image"].astype(str)
 
-    # Optional population filter, useful if distance_summary has darkest + second_darkest
+    # ----------------------------
+    # Optional distance population filter
+    # ----------------------------
     if distance_population is not None:
         if "feature_population" not in distance_plot.columns:
             raise ValueError(
@@ -1507,21 +1543,54 @@ def plot_feature_diameter_vs_distance(
             distance_plot["feature_population"] == distance_population
         ].copy()
 
-    # If multiple distance rows remain per image, aggregate to one row per image
-    distance_plot = (
-        distance_plot
-        .groupby("image", as_index=False)
-        .agg(
-            distance_value_nm=(distance_col, "mean")
+    # ----------------------------
+    # Prepare feature table
+    # ----------------------------
+    if statistic == "mean":
+        feature_plot = feature_plot[
+            ["image", diameter_col, diameter_std_col]
+        ].rename(
+            columns={
+                diameter_col: "diameter_value_nm",
+                diameter_std_col: "diameter_std_nm"
+            }
         )
-    )
+    else:
+        feature_plot = feature_plot[
+            ["image", diameter_col]
+        ].rename(
+            columns={
+                diameter_col: "diameter_value_nm"
+            }
+        )
+        feature_plot["diameter_std_nm"] = 0.0
 
-    feature_plot = feature_plot[
-        ["image", diameter_col]
-    ].rename(
-        columns={diameter_col: "diameter_value_nm"}
-    )
+    # ----------------------------
+    # Prepare distance table
+    # If multiple distance rows remain per image, aggregate them.
+    # ----------------------------
+    if statistic == "mean":
+        distance_plot = (
+            distance_plot
+            .groupby("image", as_index=False)
+            .agg(
+                distance_value_nm=(distance_col, "mean"),
+                distance_std_nm=(distance_std_col, "mean")
+            )
+        )
+    else:
+        distance_plot = (
+            distance_plot
+            .groupby("image", as_index=False)
+            .agg(
+                distance_value_nm=(distance_col, "mean")
+            )
+        )
+        distance_plot["distance_std_nm"] = 0.0
 
+    # ----------------------------
+    # Merge
+    # ----------------------------
     plot_df = pd.merge(
         feature_plot,
         distance_plot,
@@ -1554,6 +1623,9 @@ def plot_feature_diameter_vs_distance(
     plot_df = plot_df.sort_values("image").copy()
     plot_df["image"] = plot_df["image"].astype(str)
 
+    # ----------------------------
+    # Plot
+    # ----------------------------
     x = np.arange(len(plot_df))
     width = 0.36
 
@@ -1569,25 +1641,47 @@ def plot_feature_diameter_vs_distance(
 
     fig, ax = plt.subplots(figsize=(12, 5.8))
 
+    # Error bars only for mean plot
+    if statistic == "mean":
+        diameter_yerr = plot_df["diameter_std_nm"].fillna(0).values
+        distance_yerr = plot_df["distance_std_nm"].fillna(0).values
+    else:
+        diameter_yerr = None
+        distance_yerr = None
+
     bars_diameter = ax.bar(
         x - width / 2,
         plot_df["diameter_value_nm"],
         width,
+        yerr=diameter_yerr,
+        capsize=5 if statistic == "mean" else 0,
         color=bar_colors,
         edgecolor="black",
         linewidth=0.8,
-        label=diameter_label
+        label=diameter_label,
+        error_kw={
+            "ecolor": errorbar_color,
+            "elinewidth": 1.6,
+            "capthick": 1.6
+        } if statistic == "mean" else None
     )
 
     bars_distance = ax.bar(
         x + width / 2,
         plot_df["distance_value_nm"],
         width,
+        yerr=distance_yerr,
+        capsize=5 if statistic == "mean" else 0,
         color=bar_colors,
         edgecolor="black",
         linewidth=0.8,
         hatch="///",
-        label=distance_label
+        label=distance_label,
+        error_kw={
+            "ecolor": errorbar_color,
+            "elinewidth": 1.6,
+            "capthick": 1.6
+        } if statistic == "mean" else None
     )
 
     # Preserve sample-specific hatch on feature-diameter bars
@@ -1595,7 +1689,7 @@ def plot_feature_diameter_vs_distance(
         if hatch is not None:
             bar.set_hatch(hatch)
 
-    # Combine sample hatch with distance hatch when needed
+    # Distance bars always get additional hatch
     for bar, hatch in zip(bars_distance, bar_hatches):
         if hatch is not None:
             bar.set_hatch(hatch + "///")
@@ -1610,12 +1704,201 @@ def plot_feature_diameter_vs_distance(
     )
 
     ax.set_ylabel("Length scale (nm)")
-    ax.set_title(title)
+
+    if statistic == "mean":
+        ax.set_title(title + " | Mean ± SD")
+    else:
+        ax.set_title(title + " | Median")
+
     ax.legend(frameon=False)
 
     ax.grid(axis="y", alpha=0.3)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
+
+    plt.tight_layout()
+
+    if output_path is not None:
+        plt.savefig(
+            output_path,
+            dpi=300,
+            bbox_inches="tight"
+        )
+
+    plt.show()
+
+def plot_nearest_centroid_distance_histograms(
+    df_distances,
+    output_path=None,
+    bins=20,
+    distance_col="nearest_centroid_distance_nm",
+    group_col="image",
+    population_col="feature_population",
+    population_filter=None,
+    title="Nearest-Neighbor Centroid Distance Distribution"
+):
+    """
+    Plot histogram of nearest-neighbor centroid distances for each sample.
+
+    Parameters
+    ----------
+    df_distances:
+        Output from compute_nearest_neighbor_distances(...)
+
+    bins:
+        Number of histogram bins.
+
+    distance_col:
+        Column to plot. Default: nearest_centroid_distance_nm
+
+    population_filter:
+        Optional. Example: "darkest"
+        Use this when df_distances contains multiple feature populations.
+    """
+
+    if df_distances is None or df_distances.empty:
+        print("No distance data to plot.")
+        return
+
+    if distance_col not in df_distances.columns:
+        raise ValueError(f"{distance_col} not found in df_distances.")
+
+    df_plot = df_distances.copy()
+
+    if population_filter is not None:
+        if population_col not in df_plot.columns:
+            raise ValueError(
+                f"population_filter was provided, but {population_col} "
+                "is not in df_distances."
+            )
+
+        df_plot = df_plot[
+            df_plot[population_col] == population_filter
+        ].copy()
+
+    if df_plot.empty:
+        print("No distance data left after population filtering.")
+        return
+
+    sample_style = {
+        "Backbone random": {"color": "lightgray", "hatch": None},
+        "Sidechain random 1.5": {"color": "skyblue", "hatch": "///"},
+        "Sidechain random 1.8": {"color": "skyblue", "hatch": None},
+        "Sidechain block": {"color": "red", "hatch": None},
+        "Backbone block": {"color": "navajowhite", "hatch": None},
+        "Nafion 212": {"color": "black", "hatch": None},
+    }
+
+    desired_order = list(sample_style.keys())
+
+    samples = [
+        name for name in desired_order
+        if name in df_plot[group_col].astype(str).values
+    ]
+
+    unmatched = [
+        name for name in df_plot[group_col].astype(str).unique()
+        if name not in desired_order
+    ]
+
+    samples = samples + unmatched
+
+    n_samples = len(samples)
+
+    if n_samples == 0:
+        print("No samples found.")
+        return
+
+    # Make one row of histograms
+    fig, axes = plt.subplots(
+        1,
+        n_samples,
+        figsize=(4.2 * n_samples, 4.2),
+        sharey=True
+    )
+
+    if n_samples == 1:
+        axes = [axes]
+
+    # Use common bin edges across samples for fair comparison
+    all_values = df_plot[distance_col].dropna().values
+
+    bin_edges = np.linspace(
+        np.nanmin(all_values),
+        np.nanmax(all_values),
+        bins + 1
+    )
+
+    for ax, sample in zip(axes, samples):
+        df_sample = df_plot[
+            df_plot[group_col].astype(str) == sample
+        ].copy()
+
+        values = df_sample[distance_col].dropna().values
+
+        color = sample_style.get(
+            sample,
+            {"color": "gray"}
+        )["color"]
+
+        hatch = sample_style.get(
+            sample,
+            {"hatch": None}
+        )["hatch"]
+
+        counts, edges, patches = ax.hist(
+            values,
+            bins=bin_edges,
+            color=color,
+            edgecolor="black",
+            linewidth=0.8,
+            alpha=0.85
+        )
+
+        if hatch is not None:
+            for patch in patches:
+                patch.set_hatch(hatch)
+
+        mean_value = np.mean(values)
+        median_value = np.median(values)
+        std_value = np.std(values, ddof=1)
+
+        ax.axvline(
+            mean_value,
+            linestyle="--",
+            linewidth=1.4,
+            color="black",
+            label=f"Mean = {mean_value:.2f} nm"
+        )
+
+        ax.axvline(
+            median_value,
+            linestyle=":",
+            linewidth=1.6,
+            color="black",
+            label=f"Median = {median_value:.2f} nm"
+        )
+
+        ax.set_title(
+            f"{sample}\n"
+            f"n={len(values)}, SD={std_value:.2f} nm",
+            fontsize=10
+        )
+
+        ax.set_xlabel("Nearest centroid distance (nm)")
+        ax.grid(axis="y", alpha=0.3)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.legend(frameon=False, fontsize=8)
+
+    axes[0].set_ylabel("Feature count")
+
+    fig.suptitle(
+        title,
+        fontsize=15,
+        fontweight="bold",
+        y=1.05
+    )
 
     plt.tight_layout()
 

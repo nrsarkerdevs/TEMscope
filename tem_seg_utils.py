@@ -20,21 +20,49 @@ import cv2
 # ------------------------------------------------------------
 # Image reading and preprocessing
 # ------------------------------------------------------------
-def read_grayscale_image(path):
+def read_grayscale_image(
+    path,
+    normalization_method="robust_percentile",
+    p_low=1,
+    p_high=99
+):
     """
     Read grayscale, RGB, or RGBA image and return normalized grayscale image in [0, 1].
+
+    normalization_method:
+        "minmax"              = standard min-max normalization
+        "robust_percentile"   = percentile-clipped normalization, recommended
     """
+
     img = io.imread(path)
+
     if img.ndim == 3 and img.shape[2] == 4:
         img = img[:, :, :3]
+
     if img.ndim == 3 and img.shape[2] == 3:
         img = color.rgb2gray(img)
     elif img.ndim == 2:
         img = img.astype(float)
     else:
         raise ValueError(f"Unsupported image shape: {img.shape}")
+
     img = img.astype(float)
-    img = (img - img.min()) / (img.max() - img.min() + 1e-12)
+
+    if normalization_method == "minmax":
+        img = (img - img.min()) / (img.max() - img.min() + 1e-12)
+
+    elif normalization_method == "robust_percentile":
+        low = np.percentile(img, p_low)
+        high = np.percentile(img, p_high)
+
+        img = np.clip(img, low, high)
+        img = (img - low) / (high - low + 1e-12)
+
+    else:
+        raise ValueError(
+            "normalization_method must be 'minmax' or 'robust_percentile'"
+        )
+
     return img
 
 def contrast_preprocess(img, use_clahe=True, use_smoothing=False, smoothing_method="gaussian", gaussian_sigma=0.5, median_radius=1, clip_limit=0.03):
@@ -231,6 +259,37 @@ def measure_features(
     df = pd.DataFrame(records)
 
     return df, labeled
+
+def add_dark_pixel_rescue_mask(
+    raw_mask,
+    img_proc,
+    dark_percentile=8,
+    connection_radius_px=1
+):
+    """
+    Add very dark pixels based on an intensity percentile threshold.
+
+    This helps recover visually dark domains that KMeans does not assign
+    to the selected darkest class.
+
+    dark_percentile:
+        5 to 10 is conservative.
+        Higher values include more dark pixels but may add background texture.
+    """
+
+    threshold = np.percentile(img_proc, dark_percentile)
+
+    rescue_mask = img_proc <= threshold
+
+    combined_mask = raw_mask.astype(bool) | rescue_mask.astype(bool)
+
+    combined_mask = morphology.binary_closing(
+        combined_mask,
+        morphology.disk(connection_radius_px)
+    )
+
+    return combined_mask, rescue_mask, threshold
+    
 
 def estimate_kmeans_dark_cluster_threshold(
     image_paths,
@@ -1325,5 +1384,246 @@ def plot_nearest_neighbor_distance_summary(
 
     if output_path is not None:
         plt.savefig(output_path, dpi=300, bbox_inches="tight")
+
+    plt.show()
+
+
+def plot_feature_diameter_vs_distance(
+    feature_summary,
+    distance_summary,
+    output_path=None,
+    statistic="median",
+    diameter_metric="equivalent",
+    distance_metric="centroid",
+    distance_population=None,
+    title="Feature Diameter vs Feature-to-Feature Distance"
+):
+    """
+    Plot feature diameter and nearest-neighbor feature-to-feature distance
+    side by side for each sample.
+
+    Parameters
+    ----------
+    feature_summary:
+        Output from summarize_features_combined_by_image(...)
+
+    distance_summary:
+        Output from summarize_nearest_neighbor_distances(...)
+
+    statistic:
+        "median" or "mean"
+
+    diameter_metric:
+        "equivalent" or "feret"
+
+    distance_metric:
+        "centroid" or "edge"
+
+    distance_population:
+        Optional. Use "darkest" if distance_summary contains both darkest
+        and second_darkest populations and you only want the darkest population.
+        Leave as None for darkest_only mode or image-level aggregation.
+
+    Notes
+    -----
+    Feature diameter and nearest-neighbor distance are both plotted in nm.
+    Nearest-neighbor distance is calculated among detected segmented features only.
+    """
+
+    if feature_summary is None or feature_summary.empty:
+        print("No feature summary data to plot.")
+        return
+
+    if distance_summary is None or distance_summary.empty:
+        print("No distance summary data to plot.")
+        return
+
+    if statistic not in ["mean", "median"]:
+        raise ValueError("statistic must be 'mean' or 'median'")
+
+    if diameter_metric == "equivalent":
+        diameter_col = f"{statistic}_equiv_diameter_nm"
+        diameter_label = f"{statistic.capitalize()} equivalent diameter"
+    elif diameter_metric == "feret":
+        diameter_col = f"{statistic}_feret_diameter_max_nm"
+        diameter_label = f"{statistic.capitalize()} Feret diameter"
+    else:
+        raise ValueError("diameter_metric must be 'equivalent' or 'feret'")
+
+    if distance_metric == "centroid":
+        distance_col = f"{statistic}_nearest_centroid_distance_nm"
+        distance_label = f"{statistic.capitalize()} nearest-neighbor centroid distance"
+    elif distance_metric == "edge":
+        distance_col = f"{statistic}_nearest_edge_gap_nm"
+        distance_label = f"{statistic.capitalize()} nearest-neighbor edge gap"
+    else:
+        raise ValueError("distance_metric must be 'centroid' or 'edge'")
+
+    required_feature_cols = ["image", diameter_col]
+    required_distance_cols = ["image", distance_col]
+
+    missing_feature_cols = [
+        col for col in required_feature_cols
+        if col not in feature_summary.columns
+    ]
+
+    missing_distance_cols = [
+        col for col in required_distance_cols
+        if col not in distance_summary.columns
+    ]
+
+    if missing_feature_cols:
+        raise ValueError(f"Missing feature summary columns: {missing_feature_cols}")
+
+    if missing_distance_cols:
+        raise ValueError(f"Missing distance summary columns: {missing_distance_cols}")
+
+    sample_style = {
+        "Backbone random": {"color": "lightgray", "hatch": None},
+        "Sidechain random 1.5": {"color": "skyblue", "hatch": "///"},
+        "Sidechain random 1.8": {"color": "skyblue", "hatch": None},
+        "Sidechain block": {"color": "red", "hatch": None},
+        "Backbone block": {"color": "navajowhite", "hatch": None},
+        "Nafion 212": {"color": "black", "hatch": None},
+    }
+
+    desired_order = list(sample_style.keys())
+
+    feature_plot = feature_summary.copy()
+    distance_plot = distance_summary.copy()
+
+    feature_plot["image"] = feature_plot["image"].astype(str)
+    distance_plot["image"] = distance_plot["image"].astype(str)
+
+    # Optional population filter, useful if distance_summary has darkest + second_darkest
+    if distance_population is not None:
+        if "feature_population" not in distance_plot.columns:
+            raise ValueError(
+                "distance_population was provided, but distance_summary "
+                "does not contain a 'feature_population' column."
+            )
+
+        distance_plot = distance_plot[
+            distance_plot["feature_population"] == distance_population
+        ].copy()
+
+    # If multiple distance rows remain per image, aggregate to one row per image
+    distance_plot = (
+        distance_plot
+        .groupby("image", as_index=False)
+        .agg(
+            distance_value_nm=(distance_col, "mean")
+        )
+    )
+
+    feature_plot = feature_plot[
+        ["image", diameter_col]
+    ].rename(
+        columns={diameter_col: "diameter_value_nm"}
+    )
+
+    plot_df = pd.merge(
+        feature_plot,
+        distance_plot,
+        on="image",
+        how="inner"
+    )
+
+    if plot_df.empty:
+        print("No overlapping samples between feature_summary and distance_summary.")
+        return
+
+    existing_order = [
+        name for name in desired_order
+        if name in plot_df["image"].values
+    ]
+
+    unmatched = [
+        name for name in plot_df["image"].values
+        if name not in desired_order
+    ]
+
+    final_order = existing_order + unmatched
+
+    plot_df["image"] = pd.Categorical(
+        plot_df["image"],
+        categories=final_order,
+        ordered=True
+    )
+
+    plot_df = plot_df.sort_values("image").copy()
+    plot_df["image"] = plot_df["image"].astype(str)
+
+    x = np.arange(len(plot_df))
+    width = 0.36
+
+    bar_colors = [
+        sample_style.get(str(name), {"color": "gray"})["color"]
+        for name in plot_df["image"]
+    ]
+
+    bar_hatches = [
+        sample_style.get(str(name), {"hatch": None})["hatch"]
+        for name in plot_df["image"]
+    ]
+
+    fig, ax = plt.subplots(figsize=(12, 5.8))
+
+    bars_diameter = ax.bar(
+        x - width / 2,
+        plot_df["diameter_value_nm"],
+        width,
+        color=bar_colors,
+        edgecolor="black",
+        linewidth=0.8,
+        label=diameter_label
+    )
+
+    bars_distance = ax.bar(
+        x + width / 2,
+        plot_df["distance_value_nm"],
+        width,
+        color=bar_colors,
+        edgecolor="black",
+        linewidth=0.8,
+        hatch="///",
+        label=distance_label
+    )
+
+    # Preserve sample-specific hatch on feature-diameter bars
+    for bar, hatch in zip(bars_diameter, bar_hatches):
+        if hatch is not None:
+            bar.set_hatch(hatch)
+
+    # Combine sample hatch with distance hatch when needed
+    for bar, hatch in zip(bars_distance, bar_hatches):
+        if hatch is not None:
+            bar.set_hatch(hatch + "///")
+        else:
+            bar.set_hatch("///")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(
+        plot_df["image"].astype(str),
+        rotation=45,
+        ha="right"
+    )
+
+    ax.set_ylabel("Length scale (nm)")
+    ax.set_title(title)
+    ax.legend(frameon=False)
+
+    ax.grid(axis="y", alpha=0.3)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    plt.tight_layout()
+
+    if output_path is not None:
+        plt.savefig(
+            output_path,
+            dpi=300,
+            bbox_inches="tight"
+        )
 
     plt.show()
